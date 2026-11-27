@@ -9,6 +9,8 @@ dependencies = [
     # mutagen and curl-cffi come with the default and curl-cffi extras.
     "yt-dlp[default,curl-cffi,deno]",
     "watchfiles",
+    # Center-cropping cover art to a square; see app/covers.py.
+    "pillow",
 ]
 
 [dependency-groups]
