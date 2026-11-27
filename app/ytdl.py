@@ -1067,6 +1067,10 @@ class Download:
             (index for index, pp in enumerate(pps) if type(pp).__name__ == 'EmbedThumbnailPP'),
             None,
         )
+        # Nothing to crop for an embed and no file requested: don't spend a
+        # network request on a thumbnail nobody will see.
+        if not options.get('save_file') and embed_index is None:
+            return
         processor = SquareCoverArtPP(
             ydl,
             save_file=bool(options.get('save_file')),
