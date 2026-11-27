@@ -24,6 +24,15 @@ RUN CI=true pnpm install && pnpm run build
 
 FROM python:3.14-slim
 
+# Filenames come from arbitrary site metadata. Without a UTF-8 locale Python
+# encodes paths with ASCII and a Korean/Japanese/Cyrillic title raises
+# UnicodeEncodeError (or is silently mangled), so pin the locale explicitly
+# instead of relying on the base image's default.
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PYTHONIOENCODING=utf-8
+ENV PYTHONUTF8=1
+
 WORKDIR /app
 
 COPY pyproject.toml uv.lock docker-entrypoint.sh ./
