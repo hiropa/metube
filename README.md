@@ -86,6 +86,35 @@ Templates use [yt-dlp's output template syntax](https://github.com/yt-dlp/yt-dlp
 | `OUTPUT_TEMPLATE_PLAYLIST` | `%(playlist_title)s/%(title)s.%(ext)s` | Filename for items added from a playlist. Empty means `OUTPUT_TEMPLATE`. |
 | `OUTPUT_TEMPLATE_CHANNEL` | `%(channel)s/%(title)s.%(ext)s` | Filename for items added from a channel. Empty means `OUTPUT_TEMPLATE`. |
 | `OUTPUT_TEMPLATE_CHAPTER` | `%(title)s - %(section_number)02d - %(section_title)s.%(ext)s` | Default filename for each chapter when **Split by chapters** is on. |
+| `SUBFOLDER_ENABLED` | `false` | Save audio downloads under `SUBFOLDER_TEMPLATE`. Off by default so an upgrade does not move existing files. |
+| `SUBFOLDER_TEMPLATE` | `%(artist,album_artist,uploader\|Unknown Artist)s/%(album\|Singles)s/%(track,title)s.%(ext)s` | Folder and filename template for audio when `SUBFOLDER_ENABLED=true`. |
+| `SUBFOLDER_TEMPLATE_VIDEO` | | Folder and filename template for video. Empty keeps `OUTPUT_TEMPLATE`/`OUTPUT_TEMPLATE_PLAYLIST`/`OUTPUT_TEMPLATE_CHANNEL`. |
+| `COVER_SQUARE_CROP` | `true` | Center-crop embedded and saved covers to 1:1 without stretching. |
+| `COVER_SAVE_FILE` | `true` | Also save the cover next to audio downloads (and `music.youtube.com` links), not only embed it. |
+| `COVER_FILENAME` | `cover` | Cover file name, without extension. |
+| `COVER_FORMAT` | `jpg` | Cover file format: `jpg` or `png`. |
+| `FILENAME_FIX_ENCODING` | `true` | Repair mojibake (UTF-8 text read as latin-1/cp1252) in file and folder names. |
+| `FILENAME_REPLACEMENT_CHAR` | `_` | Character that replaces illegal characters in names. |
+| `FILENAME_ASCII_ONLY` | `false` | Transliterate names to ASCII, dropping any part with no ASCII form. |
+
+Example: an `Artist/Album/Title` music library with square cover files:
+
+```yaml
+services:
+  metube:
+    image: ghcr.io/alexta69/metube
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      SUBFOLDER_ENABLED: "true"
+      SUBFOLDER_TEMPLATE: "%(artist,album_artist,uploader|Unknown Artist)s/%(album|Singles)s/%(track,title)s.%(ext)s"
+      COVER_SQUARE_CROP: "true"
+      COVER_SAVE_FILE: "true"
+      FILENAME_FIX_ENCODING: "true"
+    volumes:
+      - /path/to/downloads:/downloads
+```
 
 ### yt-dlp
 

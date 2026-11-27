@@ -905,6 +905,23 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     this.isAdvancedOpen = !this.isAdvancedOpen;
   }
 
+  // Read-only display of the template the server will apply to this download
+  // type. The layout is configured by environment variables, not per
+  // download, so this only shows what is active.
+  activeOutputTemplate(): string {
+    const configuration = this.downloads.configuration;
+    const audio = this.downloadType === 'audio';
+    const subfolder = audio
+      ? configuration['SUBFOLDER_TEMPLATE']
+      : configuration['SUBFOLDER_TEMPLATE_VIDEO'];
+    const enabled = audio ? configuration['SUBFOLDER_ENABLED'] === true : true;
+    if (enabled && typeof subfolder === 'string' && subfolder) {
+      return subfolder;
+    }
+    const template = configuration['OUTPUT_TEMPLATE'];
+    return typeof template === 'string' ? template : '';
+  }
+
   onCookieFileSelect(event: Event) {
     const input = event.target as HTMLInputElement;
     if (!input.files?.length) return;

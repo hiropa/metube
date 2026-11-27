@@ -356,6 +356,16 @@
                   </div>
                 </div>
                 <div class="col-12">
+                  <div class="input-group">
+                    <span class="input-group-text help-title" ngbPopover="Read-only: set by the server's OUTPUT_TEMPLATE and SUBFOLDER_* environment variables." triggers="click" autoClose="outside" container="body">Output template</span>
+                    <input type="text"
+                      class="form-control"
+                      name="outputTemplate"
+                      [value]="activeOutputTemplate()"
+                      readonly>
+                  </div>
+                </div>
+                <div class="col-12">
                   <div class="row g-2 align-items-center">
                     <div class="col-auto">
                       <div class="form-check form-switch">
