@@ -372,6 +372,61 @@ class ConfigTests(unittest.TestCase):
             c = Config()
         self.assertIn("DELETE_FILE_ON_TRASHCAN", c.frontend_safe())
 
+    def test_new_layout_defaults_are_backward_compatible(self):
+        with patch.dict(os.environ, _base_env(), clear=False):
+            c = Config()
+        # Subfolders off by default: an upgrade must not move existing files.
+        self.assertFalse(c.SUBFOLDER_ENABLED)
+        self.assertEqual(
+            c.SUBFOLDER_TEMPLATE,
+            '%(artist,album_artist,uploader|Unknown Artist)s/%(album|Singles)s/'
+            '%(track,title)s.%(ext)s',
+        )
+        self.assertEqual(c.SUBFOLDER_TEMPLATE_VIDEO, '')
+        self.assertTrue(c.COVER_SQUARE_CROP)
+        self.assertTrue(c.COVER_SAVE_FILE)
+        self.assertEqual(c.COVER_FILENAME, 'cover')
+        self.assertEqual(c.COVER_FORMAT, 'jpg')
+        self.assertTrue(c.FILENAME_FIX_ENCODING)
+        self.assertEqual(c.FILENAME_REPLACEMENT_CHAR, '_')
+        self.assertFalse(c.FILENAME_ASCII_ONLY)
+
+    def test_subfolder_enabled_boolean_is_parsed(self):
+        with patch.dict(os.environ, _base_env(SUBFOLDER_ENABLED='on'), clear=False):
+            self.assertTrue(Config().SUBFOLDER_ENABLED)
+        with patch.dict(os.environ, _base_env(SUBFOLDER_ENABLED='false'), clear=False):
+            self.assertFalse(Config().SUBFOLDER_ENABLED)
+
+    def test_cover_format_jpeg_normalizes_to_jpg(self):
+        with patch.dict(os.environ, _base_env(COVER_FORMAT='JPEG'), clear=False):
+            self.assertEqual(Config().COVER_FORMAT, 'jpg')
+
+    def test_invalid_cover_format_exits(self):
+        with patch.dict(os.environ, _base_env(COVER_FORMAT='webp'), clear=False):
+            with self.assertRaises(SystemExit):
+                Config()
+
+    def test_invalid_replacement_char_exits(self):
+        for raw in ('/', '..', 'ab', '*'):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, _base_env(FILENAME_REPLACEMENT_CHAR=raw), clear=False):
+                    with self.assertRaises(SystemExit):
+                        Config()
+
+    def test_blank_replacement_char_means_remove(self):
+        with patch.dict(os.environ, _base_env(FILENAME_REPLACEMENT_CHAR=''), clear=False):
+            self.assertEqual(Config().FILENAME_REPLACEMENT_CHAR, '')
+
+    def test_layout_and_cover_settings_reach_the_frontend(self):
+        with patch.dict(os.environ, _base_env(), clear=False):
+            safe = Config().frontend_safe()
+        for key in ('OUTPUT_TEMPLATE', 'SUBFOLDER_ENABLED', 'SUBFOLDER_TEMPLATE',
+                    'SUBFOLDER_TEMPLATE_VIDEO', 'COVER_SAVE_FILE', 'COVER_FORMAT'):
+            self.assertIn(key, safe)
+        # Still no filesystem paths or yt-dlp options in the browser payload.
+        self.assertNotIn('DOWNLOAD_DIR', safe)
+        self.assertNotIn('YTDL_OPTIONS', safe)
+
     def test_ytdl_option_presets_file_merges(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump({"With subtitles": {"writesubtitles": True}}, f)

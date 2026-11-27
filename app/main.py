@@ -21,6 +21,7 @@ from watchfiles import awatch
 
 import bg_tasks
 import format_catalog
+import path_sanitizer
 from ytdl import DownloadQueueNotifier, DownloadQueue, Download
 from download_options import DownloadOptions
 from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, browse_playlist, coerce_optional_bool
@@ -87,6 +88,16 @@ class Config:
         'OUTPUT_TEMPLATE_CHAPTER': '%(title)s - %(section_number)02d - %(section_title)s.%(ext)s',
         'OUTPUT_TEMPLATE_PLAYLIST': '%(playlist_title)s/%(title)s.%(ext)s',
         'OUTPUT_TEMPLATE_CHANNEL': '%(channel)s/%(title)s.%(ext)s',
+        'SUBFOLDER_ENABLED': 'false',
+        'SUBFOLDER_TEMPLATE': '%(artist,album_artist,uploader|Unknown Artist)s/%(album|Singles)s/%(track,title)s.%(ext)s',
+        'SUBFOLDER_TEMPLATE_VIDEO': '',
+        'COVER_SQUARE_CROP': 'true',
+        'COVER_SAVE_FILE': 'true',
+        'COVER_FILENAME': 'cover',
+        'COVER_FORMAT': 'jpg',
+        'FILENAME_FIX_ENCODING': 'true',
+        'FILENAME_REPLACEMENT_CHAR': '_',
+        'FILENAME_ASCII_ONLY': 'false',
         'DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT' : '0',
         'SUBSCRIPTION_DEFAULT_CHECK_INTERVAL': '60',
         'SUBSCRIPTION_SCAN_PLAYLIST_END': '50',
@@ -113,7 +124,7 @@ class Config:
         'YTDL_NIGHTLY_UPDATE_TIME': '',
     }
 
-    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'HTTPS', 'ENABLE_ACCESSLOG', 'ALLOW_YTDL_OPTIONS_OVERRIDES', 'ALLOW_PRIVATE_ADDRESSES')
+    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'HTTPS', 'ENABLE_ACCESSLOG', 'ALLOW_YTDL_OPTIONS_OVERRIDES', 'ALLOW_PRIVATE_ADDRESSES', 'SUBFOLDER_ENABLED', 'COVER_SQUARE_CROP', 'COVER_SAVE_FILE', 'FILENAME_FIX_ENCODING', 'FILENAME_ASCII_ONLY')
 
     def __init__(self):
         for k, v in self._DEFAULTS.items():
@@ -246,6 +257,40 @@ class Config:
         self._validate_int('SUBSCRIPTION_SCAN_PLAYLIST_END', minimum=1)
         self._validate_int('SUBSCRIPTION_MAX_SEEN_IDS', minimum=1)
 
+        # FILENAME_REPLACEMENT_CHAR must stay a single harmless character: it
+        # is substituted into every path component, so a separator or a dot
+        # would reintroduce the traversal and hidden-file cases it replaces.
+        # An empty value means "remove the illegal characters" instead.
+        if (self.FILENAME_REPLACEMENT_CHAR
+                and (len(self.FILENAME_REPLACEMENT_CHAR) != 1
+                     or self.FILENAME_REPLACEMENT_CHAR in '/\\<>:"|?*. '
+                     or not self.FILENAME_REPLACEMENT_CHAR.isprintable())):
+            log.error(
+                'Environment variable "FILENAME_REPLACEMENT_CHAR" must be one printable '
+                'character, none of / \\ < > : " | ? * . or space; got "%s"',
+                self.FILENAME_REPLACEMENT_CHAR)
+            sys.exit(1)
+
+        # jpg and jpeg are the same encoder; normalise so the saved file and
+        # Pillow's format argument always agree. "jpeg" would also make the
+        # saved name cover.jpeg, which surprises a cover.jpg setting.
+        self.COVER_FORMAT = self.COVER_FORMAT.strip().lower().lstrip('.')
+        if self.COVER_FORMAT == 'jpeg':
+            self.COVER_FORMAT = 'jpg'
+        if self.COVER_FORMAT not in ('jpg', 'png'):
+            log.error(
+                'Environment variable "COVER_FORMAT" must be jpg or png, got "%s"',
+                self.COVER_FORMAT)
+            sys.exit(1)
+        if not self.COVER_FILENAME.strip():
+            self.COVER_FILENAME = self._DEFAULTS['COVER_FILENAME']
+
+        path_sanitizer.configure(
+            fix_encoding=self.FILENAME_FIX_ENCODING,
+            replacement=self.FILENAME_REPLACEMENT_CHAR,
+            ascii_only=self.FILENAME_ASCII_ONLY,
+        )
+
         self._runtime_overrides = {}
 
         success,_ = self.load_ytdl_options()
@@ -296,6 +341,14 @@ class Config:
         'SUBSCRIPTION_DEFAULT_CHECK_INTERVAL',
         'ALLOW_YTDL_OPTIONS_OVERRIDES',
         'DELETE_FILE_ON_TRASHCAN',
+        # Read-only display in the form's Advanced Options: the templates are
+        # configured by the operator, not chosen per download.
+        'OUTPUT_TEMPLATE',
+        'SUBFOLDER_ENABLED',
+        'SUBFOLDER_TEMPLATE',
+        'SUBFOLDER_TEMPLATE_VIDEO',
+        'COVER_SAVE_FILE',
+        'COVER_FORMAT',
     )
 
     def frontend_safe(self) -> dict:

@@ -21,6 +21,8 @@ import yt_dlp.networking.impersonate
 from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.utils import STR_FORMAT_RE_TMPL, STR_FORMAT_TYPES
 import bg_tasks
+import path_sanitizer
+from covers import SquareCoverArtPP
 from dl_formats import get_format, get_opts, merge_ytdl_option_layers
 from download_options import DownloadOptions
 import format_catalog
@@ -275,29 +277,42 @@ def _is_within_directory(real_base: str, real_target: str) -> bool:
         return False
 
 
-# Characters that are invalid in Windows/NTFS path components. These are pre-
-# sanitised when substituting playlist/channel titles into output templates so
-# that downloads do not fail on NTFS-mounted volumes or Windows Docker hosts.
-_WINDOWS_INVALID_PATH_CHARS = re.compile(r'[\\:*?"<>|]')
-_PATH_SEP_OR_TRAVERSAL = re.compile(r'[\\/]|\.\.')
-
-
 def _sanitize_path_component(value: Any) -> Any:
-    """Replace characters that are invalid in Windows path components with '_'.
+    """Make one untrusted value safe as a file or directory name.
 
     Non-string values (int, float, None, …) are passed through unchanged so
     that numeric format specs (e.g. ``%(playlist_index)02d``) still work.
-    Only string values are sanitised because Windows-invalid characters are
-    only a concern for human-readable strings (titles, channel names, etc.)
-    that may end up as directory names.  Path separators and ``..`` segments
-    are also collapsed so attacker-controlled playlist/channel titles cannot
-    escape the download directory via the output template.
+    String values go through :func:`path_sanitizer.sanitize_path_component`:
+    encoding repair, illegal-character replacement, path traversal removal,
+    reserved-name handling and the 255-byte limit, all in one place.
     """
     if not isinstance(value, str):
         return value
-    value = _WINDOWS_INVALID_PATH_CHARS.sub('_', value)
-    value = _PATH_SEP_OR_TRAVERSAL.sub('_', value)
-    return value.lstrip('.').strip() or '_'
+    return path_sanitizer.sanitize_path_component(value)
+
+
+def _sanitize_output_path(path: str, roots) -> str:
+    """Sanitise every component of *path* below whichever download root holds it.
+
+    The root itself is left alone: a configured DOWNLOAD_DIR may legitimately
+    contain characters this sanitiser would rewrite. Only the parts yt-dlp
+    derived from metadata are touched, which covers the main file, chapter
+    files, thumbnails, subtitles and infojson alike because they all pass
+    through ``prepare_filename``.
+    """
+    if not path or not roots:
+        return path
+    absolute = os.path.abspath(path)
+    for root in sorted(roots, key=len, reverse=True):
+        if not _is_within_directory(root, absolute):
+            continue
+        relative = os.path.relpath(absolute, root)
+        if relative == '.':
+            return path
+        parts = [path_sanitizer.sanitize_path_component(part)
+                 for part in relative.split(os.sep)]
+        return os.path.join(root, *parts)
+    return path
 
 
 # Room left for the suffixes yt-dlp appends after prepare_filename has run:
@@ -412,9 +427,11 @@ class _ConfinedYoutubeDL(yt_dlp.YoutubeDL):
         # common on some sites, and the download fails outright when they do.
         # Every output path comes through here, so trimming once keeps the
         # main file, its chapter files, thumbnails and subtitles consistent.
-        if filename and filename != '-':
-            filename = _trim_to_name_max(filename)
         if filename and filename != '-' and self._allowed_roots:
+            # Check the path yt-dlp produced *before* sanitising it. Sanitising
+            # a component can rename it (and, for a dot-only component, move
+            # where it lands), and a containment refusal must be decided on
+            # what the template actually resolved to.
             resolved = os.path.realpath(filename)
             if not any(_is_within_directory(root, resolved) for root in self._allowed_roots):
                 raise yt_dlp.utils.DownloadError(
@@ -424,6 +441,12 @@ class _ConfinedYoutubeDL(yt_dlp.YoutubeDL):
                 raise yt_dlp.utils.DownloadError(
                     f"Refusing to write into MeTube's state directory: {filename}"
                 )
+        if filename and filename != '-':
+            # The sanitising safety net: encoding repair and filesystem-safe
+            # names, applied per component so a repaired artist/album folder
+            # and the title inside it are handled independently.
+            filename = _sanitize_output_path(filename, self._allowed_roots)
+            filename = _trim_to_name_max(filename)
         return filename
 
 
@@ -784,6 +807,14 @@ _PERSISTED_DOWNLOAD_FIELDS = (
 )
 
 
+def _is_music_url(url: str) -> bool:
+    try:
+        host = (urlsplit(url or '').hostname or '').lower()
+    except ValueError:
+        return False
+    return host == 'music.youtube.com'
+
+
 def _short_title_for_failed_url(url: str) -> str:
     """A concise display title for a URL that failed before yt-dlp could extract a
     real title (unsupported URL, SSRF-rejected, extraction error). The full URL
@@ -841,7 +872,7 @@ class Download:
             cls.manager.shutdown()
             cls.manager = None
 
-    def __init__(self, download_dir, temp_dir, output_template, output_template_chapter, quality, format, ytdl_opts, info, allow_private=False, state_dir=None):
+    def __init__(self, download_dir, temp_dir, output_template, output_template_chapter, quality, format, ytdl_opts, info, allow_private=False, state_dir=None, cover_options=None):
         self._init_state(info)
         self.download_dir = download_dir
         self.temp_dir = temp_dir
@@ -849,6 +880,7 @@ class Download:
         self.output_template = output_template
         self.output_template_chapter = output_template_chapter
         self.allow_private = allow_private
+        self.cover_options = dict(cover_options or {})
         self.format = get_format(
             getattr(info, 'download_type', 'video'),
             getattr(info, 'codec', 'auto'),
@@ -873,6 +905,7 @@ class Download:
         self.download_dir = self.temp_dir = None
         self.output_template = self.output_template_chapter = None
         self.allow_private = False
+        self.cover_options = {}
         self.format = None
         self.ytdl_opts = {}
         self.canceled = False
@@ -1000,7 +1033,55 @@ class Download:
                 ),
                 when='pre_process',
             )
+        self._add_cover_postprocessor(ydl)
         return ydl
+
+    def _add_cover_postprocessor(self, ydl):
+        """Crop the embedded cover and/or save it beside the media.
+
+        Added before EmbedThumbnailPP in the same stage: yt-dlp runs
+        post_process postprocessors in list order, and EmbedThumbnail embeds
+        whichever thumbnail file we leave behind. A music.youtube.com URL gets
+        a saved cover even in video mode; an ordinary video download is left
+        exactly as upstream (no extra files).
+        """
+        options = self.cover_options
+        if not options:
+            return
+        download_type = getattr(self.info, 'download_type', '')
+        is_audio = download_type == 'audio'
+        # A music.youtube.com *video* download still gets a saved square
+        # cover. Captions and thumbnail downloads have their own output and
+        # must not grow an extra cover file.
+        is_music_video = (
+            download_type == 'video' and _is_music_url(getattr(self.info, 'url', '')))
+        if not (is_audio or is_music_video):
+            return
+        if not (options.get('save_file') or options.get('square')):
+            return
+        pps = getattr(ydl, '_pps', {})
+        pps = pps.get('post_process') if isinstance(pps, dict) else None
+        if not isinstance(pps, list):
+            return
+        embed_index = next(
+            (index for index, pp in enumerate(pps) if type(pp).__name__ == 'EmbedThumbnailPP'),
+            None,
+        )
+        processor = SquareCoverArtPP(
+            ydl,
+            save_file=bool(options.get('save_file')),
+            square=bool(options.get('square')),
+            filename=options.get('filename') or 'cover',
+            image_format=options.get('format') or 'jpg',
+            embed=embed_index is not None,
+        )
+        ydl.add_post_processor(processor, when='post_process')
+        pps = getattr(ydl, '_pps', {}).get('post_process')
+        if not isinstance(pps, list):
+            return
+        if embed_index is not None and processor in pps:
+            pps.remove(processor)
+            pps.insert(embed_index, processor)
 
     def _download(self):
         # Run in our own process group so cancel() can SIGKILL the whole
@@ -1811,6 +1892,39 @@ class DownloadQueue:
             params['impersonate'] = yt_dlp.networking.impersonate.ImpersonateTarget.from_str(imp)
         return yt_dlp.YoutubeDL(params=params).extract_info(url, download=False)
 
+    def _subfolder_template(self, dl):
+        """The Artist/Album layout for this download, or None for the upstream template.
+
+        Audio uses SUBFOLDER_TEMPLATE, enabled by SUBFOLDER_ENABLED (default
+        off, so an upgrade does not move anybody's files). Video is only
+        reorganised when SUBFOLDER_TEMPLATE_VIDEO is explicitly set, which
+        keeps the upstream single-folder layout as the default.
+        """
+        if getattr(dl, 'download_type', '') == 'audio':
+            template = self.config.SUBFOLDER_TEMPLATE
+            if self.config.SUBFOLDER_ENABLED is True and isinstance(template, str) and template:
+                return template
+            return None
+        template = getattr(self.config, 'SUBFOLDER_TEMPLATE_VIDEO', '')
+        return template if isinstance(template, str) and template else None
+
+    def _cover_options(self):
+        """COVER_* settings, coerced so a partially mocked config stays inert."""
+        def _bool(name, default):
+            value = getattr(self.config, name, default)
+            return value if isinstance(value, bool) else default
+
+        def _text(name, default):
+            value = getattr(self.config, name, default)
+            return value.strip() if isinstance(value, str) and value.strip() else default
+
+        return {
+            'save_file': _bool('COVER_SAVE_FILE', True),
+            'square': _bool('COVER_SQUARE_CROP', True),
+            'filename': _text('COVER_FILENAME', 'cover'),
+            'format': _text('COVER_FORMAT', 'jpg'),
+        }
+
     def __calc_download_path(self, download_type, folder):
         base_directory = self.config.AUDIO_DOWNLOAD_DIR if download_type == 'audio' else self.config.DOWNLOAD_DIR
         if folder:
@@ -1836,16 +1950,29 @@ class DownloadQueue:
             return error_message
         output = self.config.OUTPUT_TEMPLATE
         output_chapter = self.config.OUTPUT_TEMPLATE_CHAPTER
+        subfolder_template = self._subfolder_template(dl)
+        if subfolder_template:
+            output = subfolder_template
+            # Chapter splits use their own outtmpl, resolved relative to the
+            # download root. Prefix the subfolder part so chapter files land
+            # beside the media they came from, not in the root.
+            directory = output.rpartition('/')[0]
+            if directory and '/' not in output_chapter:
+                output_chapter = f'{directory}/{output_chapter}'
         entry = getattr(dl, 'entry', None)
         feed_item = entry is not None and (
             entry.get('playlist_index') is not None or entry.get('channel_index') is not None
         )
-        if entry is not None and entry.get('playlist_index') is not None:
+        # The subfolder layout wins over the feed templates when it is on: it
+        # is the operator's explicit request for an Artist/Album library, and
+        # the feed template's own default would otherwise keep playlist items
+        # out of it.
+        if not subfolder_template and entry is not None and entry.get('playlist_index') is not None:
             if len(self.config.OUTPUT_TEMPLATE_PLAYLIST):
                 output = self.config.OUTPUT_TEMPLATE_PLAYLIST
             sanitized = {k: _sanitize_path_component(v) for k, v in entry.items()}
             output = _resolve_outtmpl_fields(output, sanitized, ('playlist',))
-        if entry is not None and entry.get('channel_index') is not None:
+        if not subfolder_template and entry is not None and entry.get('channel_index') is not None:
             if len(self.config.OUTPUT_TEMPLATE_CHANNEL):
                 output = self.config.OUTPUT_TEMPLATE_CHANNEL
             sanitized = {k: _sanitize_path_component(v) for k, v in entry.items()}
@@ -1864,7 +1991,12 @@ class DownloadQueue:
         if playlist_item_limit > 0:
             log.info(f'playlist limit is set. Processing only first {playlist_item_limit} entries')
             ytdl_options['playlistend'] = playlist_item_limit
-        download = Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, dl.quality, dl.format, ytdl_options, dl, allow_private=self.config.ALLOW_PRIVATE_ADDRESSES, state_dir=self.config.STATE_DIR)
+        download = Download(
+            dldirectory, self.config.TEMP_DIR, output, output_chapter, dl.quality, dl.format,
+            ytdl_options, dl, allow_private=self.config.ALLOW_PRIVATE_ADDRESSES,
+            state_dir=self.config.STATE_DIR,
+            cover_options=self._cover_options(),
+        )
         is_upcoming = (
             getattr(dl, 'live_status', None) == 'is_upcoming'
             or getattr(dl, 'status', None) == 'scheduled'
